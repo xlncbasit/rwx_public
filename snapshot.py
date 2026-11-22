@@ -103,8 +103,7 @@ def walk(cls, mod, out):
             walk(v, mod, out)
 
 
-def main():
-    spec = json.load(sys.stdin)
+def run(spec):
     sys.meta_path.insert(0, _Finder(spec.get("patched", {})))
     errs = {}
     for m in spec["mods"]:  # a module that no longer imports breaks every test that loads it
@@ -128,7 +127,8 @@ def main():
                 g[n] = "fn"
             else:
                 g[n] = hashlib.md5(canon(v).encode()).hexdigest()[:12]
-    print(json.dumps({"ok": True, "errs": errs, "cls": cls, "glob": glob}))
+    return {"ok": True, "errs": errs, "cls": cls, "glob": glob}
 
 
-main()
+if __name__ == "__main__":
+    print(json.dumps(run(json.load(sys.stdin))))

@@ -13,6 +13,10 @@ HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 SRC = Path(os.environ.get("SQLGLOT_DIR", "/opt/sqlglot"))
 MAP = Path(os.environ.get("MAP_FILE", HERE / "data" / "map.json.gz"))
+TPCDS_MAP = Path(os.environ.get("TPCDS_MAP", HERE / "data" / "tpcds.json.gz"))
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_BUDGET = float(os.environ.get("TPCDS_BUDGET", "5"))  # local CPU s of replay worth spending to drop a 21.5 s test (graders run ~2.6x slower)
+TPCDS_SHARE = float(os.environ.get("TPCDS_SHARE", "0.6"))  # replay CPU s allowed per commit of the batch
 WORKER_MS, MAXW = 2000, 8
 
 
@@ -49,6 +53,7 @@ class Ctx:
         self.dep = m.get("dep", {})  # module -> modules defining subclasses of its classes
         self._sub = None
         self._snap = {}
+        self._sn = None
         self.imp = {f: {int(l): i for l, i in d.items()} for f, d in m.get("imp", {}).items()}  # file -> line -> id of the set of modules whose import executed that line
         self.impsets = m.get("impsets", [])
         self.impmods = m.get("impmods", [])
@@ -86,10 +91,54 @@ class Ctx:
         key = (tuple(sorted(mods)), tuple(sorted((k, hash(v)) for k, v in patched.items())))
         r = self._snap.get(key)
         if r is None:
-            p = subprocess.run([sys.executable, str(HERE / "snapshot.py")], input=json.dumps({"mods": sorted(mods), "patched": patched}),
-                               capture_output=True, text=True, timeout=90, env={**os.environ, "SQLGLOT_DIR": str(SRC), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0"})
-            r = self._snap[key] = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {"ok": False}
+            r = self._snap[key] = self._fork_snapshot(sorted(mods), patched)
         return r
+
+    def _fork_snapshot(self, mods, patched):
+        """Import the modules in a forked child of a process that already holds the core of sqlglot (cheaper than a fresh interpreter)."""
+        if self._sn is None:
+            sys.path.insert(0, str(HERE))
+            import snapshot as sn
+            sys.path.insert(0, str(SRC))
+            try:
+                import sqlglot  # noqa: F401
+            except Exception:
+                sn = False
+            self._sn = sn
+        patched_mods = {module_of(p) for p in patched}
+        if self._sn is False or patched_mods & set(sys.modules):  # a core module is itself patched: needs a clean interpreter
+            return self._spawn_snapshot(mods, patched)
+        spec = {"mods": mods, "patched": patched}
+        rd, wr = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # child
+            try:
+                os.close(rd)
+                data = json.dumps(self._sn.run(spec)).encode()
+            except BaseException:
+                data = b'{"ok": false}'
+            with os.fdopen(wr, "wb") as fh:
+                fh.write(data)
+            os._exit(0)
+        os.close(wr)
+        chunks = []
+        while True:
+            c = os.read(rd, 1 << 16)
+            if not c:
+                break
+            chunks.append(c)
+        os.close(rd)
+        os.waitpid(pid, 0)
+        try:
+            return json.loads(b"".join(chunks))
+        except ValueError:
+            return self._spawn_snapshot(mods, patched)
+
+    def _spawn_snapshot(self, mods, patched):
+        p = subprocess.run([sys.executable, str(HERE / "snapshot.py")], input=json.dumps({"mods": mods, "patched": patched}),
+                           capture_output=True, text=True, timeout=90,
+                           env={**os.environ, "SQLGLOT_DIR": str(SRC), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0"})
+        return json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {"ok": False}
 
     def cov_range(self, f, a, b):
         """Tests that ran lines a..b (outside module imports)."""
@@ -242,6 +291,7 @@ def impact_line(cx, f, tree, line, insert, out, st):
     if func is not None:
         a, b = (start_of(func), func.end_lineno) if insert else (start_of(stmt), header_end(stmt))
         out.update(cx.cov_range(f, a, b))
+        st["ranges"].append((f, a, b))
         im = cx.imp_mods(f, a, b)  # code that also runs while modules are imported: its effect is baked into their state
         if im:
             st["mods"] |= im
@@ -253,6 +303,7 @@ def impact_line(cx, f, tree, line, insert, out, st):
         kids = child_stmts(stmt)
         a = kids[0].lineno if kids else stmt.end_lineno
         out.update(cx.cov_range(f, a, stmt.end_lineno))
+        st["ranges"].append((f, a, stmt.end_lineno))
         im = cx.imp_mods(f, a, stmt.end_lineno)
         if im:
             st["mods"] |= im
@@ -261,8 +312,11 @@ def impact_line(cx, f, tree, line, insert, out, st):
     return SEM
 
 
-def sem_tests(cx, f, new_text, extra=()):
-    """Tests affected by what the patched module defines differently from the old one (None: run everything)."""
+def sem_tests(cx, f, new_text, extra=(), rep=None):
+    """Tests affected by what the patched module defines differently from the old one (None: run everything).
+    rep gets "pairs": the (class, attribute) reads that observe the change, or "opaque" if the change is more than that."""
+    rep = {} if rep is None else rep
+    rep["pairs"], rep["names"], rep["private"] = set(), set(), set()
     M = module_of(f)
     mods = {M} | set(cx.dep.get(M, ())) | set(extra)
     for _ in range(4):
@@ -277,32 +331,40 @@ def sem_tests(cx, f, new_text, extra=()):
         for m, err in b["errs"].items():  # no longer imports: every test that loads it breaks
             if m not in a["errs"]:
                 out |= set(cx.mods.get(m, ())) or set(cx.all)
+                rep["opaque"] = "import-error"
         for C in set(a["cls"]) | set(b["cls"]):
             sa, sb = a["cls"].get(C), b["cls"].get(C)
             if sa is None or sb is None:
                 out |= loaded
+                rep["opaque"] = "class-added-removed"
                 continue
             for attr in set(sa) | set(sb):
                 if sa.get(attr) == sb.get(attr):
                     continue
                 if attr in ("<mro>", "<fns>"):
                     out |= loaded if attr == "<mro>" else set(cx.used.get(C, ())) | loaded
+                    rep["opaque"] = "mro-or-fns"
                 elif attr in sa:
                     changed.append((C, attr))
                     for T in (C, *cx.subs(C)):
                         out |= cx.acc.get(attr, {}).get(T, set())
-                        if cx.acci.get(attr, {}).get(T) or attr.startswith("_"):
+                        rep["pairs"].add(f"{T}|{attr}")
+                        if attr.startswith("_"):
+                            rep["private"].add(T)
                             # state derived at class creation, or read while a module was imported, may be cached in objects we cannot see
                             out |= set(cx.used.get(T, ()))
                     if attr not in cx.acc:  # read through something other than a recorded descriptor
                         out |= set(cx.used.get(C, ())) or loaded
+                        rep["opaque"] = "unrecorded-attr"
                 else:  # new constant: nobody could have read it through a recorded descriptor
                     out |= cx.taint(attr) & (set(cx.used.get(C, ())) or loaded)
+                    rep["opaque"] = "new-attr"
         for mod in set(a["glob"]) | set(b["glob"]):
             ga, gb = a["glob"].get(mod, {}), b["glob"].get(mod, {})
             for n in set(ga) | set(gb):
                 if ga.get(n) != gb.get(n):
                     out |= cx.taint(n) & set(cx.mods.get(mod, ())) if n in ga else cx.taint(n) & loaded
+                    rep["names"].add(n)
         # modules that read a changed constant while being imported hold derived state we have not compared yet
         more = {m for C, attr in changed for T in (C, *cx.subs(C)) for m in cx.acci.get(attr, {}).get(T, ())} - mods
         if not more:
@@ -390,8 +452,42 @@ def impact_test_file(cx, fp):
     return out
 
 
-def impact_file(cx, fp):
-    """Set of tests, or None meaning 'run everything'."""
+EXEC_FIXTURES = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql": "tpch", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": "tpcds"}
+
+
+def executor_unaffected(cx, path, new_text):
+    """TestExecutor.setUpClass loads both TPC fixtures into cls.tpch_sqls / cls.tpcds_sqls for every test of the
+    class. A test whose own code never mentions that benchmark only needs the file to still load."""
+    word = EXEC_FIXTURES.get(path)
+    if word is None:
+        return set()
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_br_helpers", SRC / "tests/helpers.py")
+    hp = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(hp)
+        statements = hp._filter_comments(new_text).split(";")  # same steps as load_sql_fixture_pairs
+        for i in range(0, len(statements), 2):
+            if i + 1 < len(statements):
+                hp._extract_meta(statements[i].strip())
+                statements[i + 1].strip()
+    except Exception:
+        return set()
+    tf = "tests/test_executor.py"
+    tree = ast.parse((SRC / tf).read_text())
+    out = set()
+    for cls in tree.body:
+        if isinstance(cls, ast.ClassDef) and cls.name == "TestExecutor":
+            for fn in cls.body:
+                if isinstance(fn, FUNCS) and fn.name.startswith("test") and word not in ast.get_source_segment((SRC / tf).read_text(), fn):
+                    out |= {t["number"] for t in cx.tests if t["id"] == f"{tf}::TestExecutor::{fn.name}"}
+    return out
+
+
+def impact_file(cx, fp, info=None):
+    """Set of tests, or None meaning 'run everything'. `info` gets the patched source and, when every change is
+    plain runtime code inside function bodies, the changed line ranges ("ranges")."""
+    info = {} if info is None else info
     path = fp.path
     if fp.binary:
         return set() if path.startswith(INERT_TOP) or path.endswith(INERT_SUFFIX) else None
@@ -400,7 +496,7 @@ def impact_file(cx, fp):
             return set()
         if fp.new is None or fp.old != fp.new or path not in cx.fix:
             return set(cx.fix.get(path, cx.fixfallback))
-        return set(cx.fix[path])
+        return set(cx.fix[path]) - executor_unaffected(cx, path, patchlib.apply((SRC / path).read_text(), fp))
     if path.endswith(RUNNER_FILES) or path.startswith(RUNNER_FILES):
         return None
     if path.startswith("tests/"):
@@ -417,6 +513,7 @@ def impact_file(cx, fp):
         return set(cx.mods.get(module_of(fp.old), ())) or set(cx.all)
     old_text = (SRC / f).read_text()
     new_text = patchlib.apply(old_text, fp)
+    info["src"] = new_text
     try:
         old_t = ast.parse(old_text)
     except SyntaxError:
@@ -427,7 +524,7 @@ def impact_file(cx, fp):
         return set(cx.mods.get(M, ())) or set(cx.all)
     if ast.dump(_SameIdentityEq().visit(strip_types(ast.parse(old_text)))) == ast.dump(_SameIdentityEq().visit(strip_types(new_t))):
         return set()
-    out, sem, st = set(), False, {"mods": set()}
+    out, sem, st = set(), False, {"mods": set(), "ranges": []}
     for removed, added, pos in groups(fp):
         rs = [impact_line(cx, f, old_t, l, False, out, st) for l in removed]
         if added and (not removed or added > len(removed)):
@@ -435,12 +532,96 @@ def impact_file(cx, fp):
         if any(r is False for r in rs):
             return None
         sem = sem or SEM in rs
+    info["ranges"] = st["ranges"]
     if sem:
-        r = sem_tests(cx, f, new_text, st["mods"])
+        rep = {}
+        r = sem_tests(cx, f, new_text, st["mods"], rep)
         if r is None:
             return None
         out |= r
+        if rep.get("opaque"):
+            dbg("opaque-why", f, rep["opaque"])
+            del info["ranges"]
+        else:
+            info["sem"] = rep
     return out
+
+
+def dbg(*a):
+    if os.environ.get("TPCDS_DEBUG"):
+        print("tpcds:", *a, file=sys.stderr)
+
+
+def tpcds_drop(cx, ranges, pairs, patched):
+    """True if test_execute_tpcds provably still passes: every query whose run reaches a changed line or reads a changed
+    class constant gives the same duckdb SQL and executor result as on the pinned commit, replayed with the patched
+    sources up to the first checkpoint (parsed tree, optimized tree) after which nothing changed is reached."""
+    if not hasattr(cx, "tq"):
+        load_tq(cx)
+    tq = cx.tq
+    if tq is None:
+        return False
+    T = cx.tpcds
+    hit = set()  # contexts ("setup", "q12", "o12", "e12") that observe the change
+    pid = {n: j for j, n in enumerate(tq["acc_names"])}
+    want_ids = {pid[p] for p in pairs.get("pairs", ()) if p in pid}
+    for c, ids in tq["acc"].items():
+        if want_ids & ids:
+            hit.add(c)
+    names = pairs.get("names", set())
+    files = {class_file(T) for T in pairs.get("private", ())}
+    if None in files:
+        return False
+    if names or files:  # a changed module global is read by lines that name it; a class's private derived state by its own code
+        rx = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b") if names else None
+        for f, d in tq["by_line"].items():
+            src = cx.source(f) if rx else None
+            for l, cs in d.items():
+                if f in files or rx and l <= len(src) and rx.search(src[l - 1]):
+                    hit |= cs
+    for f, a, b in ranges:
+        by = tq["by_line"].get(f, {})
+        cv = cx.cov.get(f, {})
+        for l in range(a, b + 1):
+            cs = by.get(l)
+            if cs:
+                hit |= cs
+            elif T in cv.get(l, ()):  # the test reaches this line outside the replayed queries (pool, setup class, ...)
+                dbg("guard", f, l)
+                return False
+    n = len(tq["secs"])
+    if "setup" in hit:  # the tables themselves are built by changed code
+        hit |= {f"e{i}" for i in range(n)}
+    mode, est = {}, 0.9
+    for i in range(n):
+        if f"e{i}" in hit:
+            mode[i], k = None, 0
+        elif f"o{i}" in hit:
+            mode[i], k = "o", 1
+        elif f"q{i}" in hit:
+            mode[i], k = "p", 2
+        else:
+            continue
+        est += tq["secs"][i][k]
+    if not mode:
+        return True
+    if est > TPCDS_BUDGET or cx.replay_left < est:
+        dbg("budget", len(mode), round(est, 1))
+        return False
+    cx.replay_left -= est
+    order = sorted(mode, key=lambda i: ({"p": 0, "o": 1, None: 2}[mode[i]], i))  # cheap checks first: a failure stops early
+    spec = {"patched": patched, "queries": order, "mode": {str(i): mode[i] for i in mode}, "cap": est * 1.25 + 0.3,
+            "want": {str(i): tq["want"][str(i)] for i in mode}}
+    try:
+        p = subprocess.run([sys.executable, str(HERE / "tpcds.py"), "verify"], input=json.dumps(spec), capture_output=True,
+                           text=True, timeout=TPCDS_BUDGET * 4 + 10,
+                           env={**os.environ, "SQLGLOT_DIR": str(SRC), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0",
+                                "TPCDS_ALARM": str(int(TPCDS_BUDGET * 4 + 5))})
+        ok = json.loads(p.stdout.strip().splitlines()[-1]).get("ok") is True
+        dbg("verify", len(mode), round(est, 1), ok)
+        return ok
+    except Exception:
+        return False
 
 
 def split(cx, chosen):
@@ -464,19 +645,67 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     with gzip.open(MAP, "rt") as fh:
         cx = Ctx(tests, json.load(fh))
-    for p in sorted((DATA / "commits").glob("*.patch")):
-        chosen = set()
-        try:
-            for fp in patchlib.parse(p.read_text()):
-                r = impact_file(cx, fp)
-                if r is None:
-                    chosen = set(cx.all)
-                    break
-                chosen |= r
-        except Exception as e:  # never miss because of a bug: run everything
-            print(f"{p.stem}: {e!r}", file=sys.stderr)
-            chosen = set(cx.all)
-        print(json.dumps({"commit": p.stem, "workers": split(cx, chosen)}), flush=True)
+    cx.tpcds = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
+    commits = sorted((DATA / "commits").glob("*.patch"))
+    cx.replay_left = TPCDS_SHARE * len(commits)  # keep the whole batch well inside the time limit
+    for p in commits:
+        run_commit(cx, p)
+
+
+def class_file(q):
+    """sqlglot/x/y.py defining the class 'sqlglot.x.y.Name' (None if unknown)."""
+    parts = q.split(".")
+    for k in range(len(parts) - 1, 0, -1):
+        base = "/".join(parts[:k])
+        for f in (base + ".py", base + "/__init__.py"):
+            if (SRC / f).exists():
+                return f
+    return None
+
+
+def load_tq(cx):
+    cx.tq = None
+    if cx.tpcds is not None and TPCDS_MAP.exists():
+        with gzip.open(TPCDS_MAP, "rt") as fh:
+            tq = json.load(fh)
+        by = {}
+        for c, d in tq["lines"].items():
+            for f, ls in d.items():
+                bl = by.setdefault(f, {})
+                for l in ls:
+                    bl.setdefault(l, set()).add(c)
+        cx.tq = {"by_line": by, "acc": {c: set(v) for c, v in tq["acc"].items()}, "acc_names": tq["acc_names"],
+                 "secs": {int(i): v for i, v in tq["secs"].items()}, "want": tq["want"]}
+
+def run_commit(cx, p):
+    chosen = set()
+    try:
+        opaque, ranges, pairs, patched = set(), [], {}, {}
+        for fp in patchlib.parse(p.read_text()):
+            info = {}
+            r = impact_file(cx, fp, info)
+            if r is None:
+                chosen = set(cx.all)
+                opaque = chosen
+                break
+            chosen |= r
+            if "src" in info:
+                patched[fp.path] = info["src"]
+            if "ranges" in info:
+                ranges += info["ranges"]
+                for k, v in info.get("sem", {}).items():
+                    if k in ("pairs", "names", "private"):
+                        pairs.setdefault(k, set()).update(v)
+            else:
+                opaque |= r
+        if cx.tpcds in chosen and cx.tpcds in opaque:
+            dbg("opaque", p.stem)
+        if cx.tpcds in chosen and cx.tpcds not in opaque and (dbg("commit", p.stem) or tpcds_drop(cx, ranges, pairs, patched)):
+            chosen.discard(cx.tpcds)
+    except Exception as e:  # never miss because of a bug: run everything
+        print(f"{p.stem}: {e!r}", file=sys.stderr)
+        chosen = set(cx.all)
+    print(json.dumps({"commit": p.stem, "workers": split(cx, chosen)}), flush=True)
 
 
 if __name__ == "__main__":
