@@ -16,4 +16,6 @@ RUN PYTHONHASHSEED=0 python /app/replay.py tables /app/data/replay_tables.pkl
 RUN python -m compileall -q /opt/sqlglot/sqlglot /app && chmod -R a+rX /app /opt/sqlglot
 
 ENV SQLGLOT_DIR=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
+# PROBE (not for the final): never select the three heaviest tests
+ENV PROBE_DROP=tests/test_parser.py::TestParser::test_max_nodes,tests/test_executor.py::TestExecutor::test_execute_tpcds,tests/test_generator.py::TestGenerator::test_generator_memory
 CMD ["python", "/app/selector.py"]
