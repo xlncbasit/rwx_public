@@ -748,6 +748,8 @@ def run_commit(cx, p):
         chosen = set(cx.all)
     probe = {t["number"] for t in cx.tests if t["id"] in os.environ.get("PROBE_DROP", "").split(",")}
     chosen -= probe  # diagnostic builds only (unset by default): measures what given tests cost on the practice set
+    if len(chosen) > int(os.environ.get("PROBE_BIG", "0") or 10**9):  # diagnostic builds only: what broad selections cost
+        chosen = set()
     print(json.dumps({"commit": p.stem, "workers": split(cx, chosen)}), flush=True)
 
 
