@@ -846,6 +846,127 @@ _POOL = re.compile(r"ProcessPool|multiprocessing|get_context\(")
 _pooled = {}
 
 
+RUN_BUDGET = float(os.environ.get("RUN_BUDGET", "1.0"))  # recorded seconds of a selection worth running here
+RUN_SHARE = float(os.environ.get("RUN_SHARE", "0.4"))  # local CPU s of test runs allowed per commit of the batch
+
+
+def runnable(cx, chosen):
+    """Whether runner.py can run every chosen test faithfully in one process with the patched code: light tests, in
+    files that hand no work to other processes (they would load the unpatched sqlglot) and whose instrumented run
+    passed (subprocess users failed it), defined directly in their class."""
+    for n in chosen:
+        t = cx.T[n]
+        if t["seconds"] >= 1.0 or t["id"].count("::") != 2 or n in getattr(cx, "vbad", ()) or n in cx.replayable:
+            return False
+        path = t["file"]
+        if path not in _pooled:
+            q = SRC / path
+            _pooled[path] = not q.exists() or bool(_POOL.search(q.read_text()))
+        if _pooled[path]:  # subprocess users failed their instrumented run: they are in vbad
+            return False
+    return True
+
+
+_IMPORTERS = {}
+
+
+def importers_of(mods):
+    """sqlglot modules that import any of `mods`, transitively (static scan of import statements), plus `mods`."""
+    if not _IMPORTERS and (HERE / "data" / "imports.json").exists():  # written at image build time
+        _IMPORTERS.update({k: set(v) for k, v in json.loads((HERE / "data" / "imports.json").read_text()).items()})
+    if not _IMPORTERS:
+        for p in (SRC / "sqlglot").rglob("*.py"):
+            rel = str(p.relative_to(SRC))
+            me = module_of(rel)
+            pkg = me if rel.endswith("__init__.py") else me.rpartition(".")[0]
+            try:
+                tree = ast.parse(p.read_text())
+            except SyntaxError:
+                continue
+            for n in ast.walk(tree):
+                names = []
+                if isinstance(n, ast.Import):
+                    names = [a.name for a in n.names]
+                elif isinstance(n, ast.ImportFrom):
+                    base = n.module or ""
+                    if n.level:
+                        up = pkg.split(".")
+                        up = up[: len(up) - n.level + 1] if n.level > 1 else up
+                        base = ".".join(up + ([n.module] if n.module else []))
+                    names = [base] + [f"{base}.{a.name}" for a in n.names]
+                for x in names:
+                    while x.startswith("sqlglot"):
+                        _IMPORTERS.setdefault(x, set()).add(me)
+                        x = x.rpartition(".")[0]
+    out, todo = set(), list(mods)
+    while todo:
+        m = todo.pop()
+        if m in out:
+            continue
+        out.add(m)
+        todo.extend(_IMPORTERS.get(m, ()))
+    return out
+
+
+def hot_verify(cx, chosen, patched):
+    """Run the chosen tests in a forked child against the patched code (changed function bodies swapped into the
+    already imported modules) and return the tests to keep: those that fail, and those not run after the first
+    failure. Anything unexpected keeps the whole selection."""
+    est = sum(cx.ms[n] for n in chosen) / 1000
+    if est > RUN_BUDGET or cx.run_left < est + 0.15:
+        return chosen
+    if not hasattr(cx, "vbad"):  # tests whose instrumented run failed (subprocess users): never run here
+        cx.vbad = set()
+        if VMAP.exists():
+            with gzip.open(VMAP, "rt") as fh:
+                cx.vbad = set(json.load(fh)["bad"])
+    if not runnable(cx, chosen):
+        return chosen
+    cx.run_left -= est + 0.15
+    if "sqlglot" not in sys.modules:  # children inherit the core; the parent must stay as the snapshots expect it
+        sys.path.insert(0, str(SRC))
+        import sqlglot  # noqa: F401
+    order = sorted(chosen, key=lambda n: (cx.ms[n], n))
+    ids = [(cx.T[n]["id"], max(2.0, 10 * cx.T[n]["seconds"])) for n in order]
+    # computed in the parent: the import graph is scanned once and inherited by every child
+    evict = sorted(importers_of({module_of(f) for f in patched if f.startswith("sqlglot/")}) & set(sys.modules), key=lambda m: m.count("."))
+    rd, wr = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            os.close(rd)
+            import io, contextlib
+            sys.path.insert(0, str(HERE))
+            import runner
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                runner.prepare(patched, evict)
+                fail, notrun = runner.run_tests(ids, stop_first=True)
+            data = json.dumps({"fail": sorted(fail), "notrun": sorted(notrun)}).encode()
+        except BaseException:
+            data = b'{"fail": null}'
+        with os.fdopen(wr, "wb") as fh:
+            fh.write(data)
+        os._exit(0)
+    os.close(wr)
+    chunks = []
+    while True:
+        c = os.read(rd, 1 << 16)
+        if not c:
+            break
+        chunks.append(c)
+    os.close(rd)
+    os.waitpid(pid, 0)
+    try:
+        r = json.loads(b"".join(chunks))
+    except ValueError:
+        return chosen
+    if r.get("fail") is None:
+        return chosen
+    keep = set(r["fail"]) | set(r["notrun"])
+    dbg("run", len(chosen), "fail", len(r["fail"]), "notrun", len(r["notrun"]))
+    return {n for n in chosen if cx.T[n]["id"] in keep}
+
+
 def split(cx, chosen):
     if not chosen:
         return []
@@ -875,6 +996,7 @@ def main():
     cx.replayable = {t["number"] for t in tests if t["id"] in REPLAYABLE}
     commits = sorted((DATA / "commits").glob("*.patch"))
     cx.replay_left = REPLAY_SHARE * len(commits)
+    cx.run_left = RUN_SHARE * len(commits)
     cx.T = {t["number"]: t for t in tests}  # keep the whole batch well inside the time limit
     for p in commits:
         run_commit(cx, p)
@@ -934,6 +1056,7 @@ def run_commit(cx, p):
     chosen = set()
     try:
         opaque, ranges, pairs, patched = set(), [], {}, {}
+        pure = True  # every change is plain code inside sqlglot function bodies (no signature, class or module level)
         soft, fixtures = set(), {}  # tests a change reaches in ways only a replay of every query can judge; edited TPC fixtures
         for fp in patchlib.parse(p.read_text()):
             info = {}
@@ -945,6 +1068,7 @@ def run_commit(cx, p):
             chosen |= r
             if "src" in info:
                 patched[fp.path] = info["src"]
+            pure = pure and not fp.binary and fp.old is not None and fp.old == fp.new and fp.path.endswith(".py") and fp.path.startswith(("sqlglot/", "tests/")) and not fp.path.endswith(RUNNER_FILES) and "fixture" not in info
             if "ranges" in info:
                 ranges += info["ranges"]
                 for k, v in info.get("sem", {}).items():
@@ -961,6 +1085,8 @@ def run_commit(cx, p):
         if cand:
             dbg("commit", p.stem)
             chosen -= replay_drop(cx, cand, ranges, pairs, patched, soft, fixtures)
+        if pure and chosen and chosen != cx.all:
+            chosen = hot_verify(cx, chosen, patched)
     except Exception as e:  # never miss because of a bug: run everything
         print(f"{p.stem}: {e!r}", file=sys.stderr)
         chosen = set(cx.all)

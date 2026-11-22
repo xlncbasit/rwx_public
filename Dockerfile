@@ -8,12 +8,14 @@ data = urllib.request.urlopen(f"https://github.com/tobymao/sqlglot/archive/{sha}
 tarfile.open(fileobj=io.BytesIO(data)).extractall("/opt")
 os.rename(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 P
-COPY selector.py patchlib.py snapshot.py replay.py /app/
+COPY selector.py patchlib.py snapshot.py replay.py runner.py /app/
 COPY data/map.json.gz data/replay.json.gz data/vmap.json.gz /app/data/
 # the TPC tests are proven safe by replaying single queries: their CSV tables, parsed at build time like setUpClass
 RUN PYTHONHASHSEED=0 python /app/replay.py tables /app/data/replay_tables.pkl
 # the coverage map as a pickle with its line index prebuilt: loads faster than the JSON
 RUN python -c "import gzip, json, pickle; m = json.load(gzip.open('/app/data/map.json.gz', 'rt')); m['_cov'] = {f: {int(l): m['sets'][i] for l, i in d.items()} for f, d in m['cov'].items()}; pickle.dump(m, open('/app/data/map.pkl', 'wb'), protocol=5)"
+# the static import graph of sqlglot (which modules import which), for the test runner's module eviction
+RUN python -c "import json, sys; sys.path.insert(0, '/app'); import selector; selector.importers_of(set()); json.dump({k: sorted(v) for k, v in selector._IMPORTERS.items()}, open('/app/data/imports.json', 'w'))"
 # The container's disk is read-only at run time: ship the byte-code so imports do not compile anything.
 RUN python -m compileall -q /opt/sqlglot/sqlglot /app && chmod -R a+rX /app /opt/sqlglot
 
