@@ -8,7 +8,7 @@ data = urllib.request.urlopen(f"https://github.com/tobymao/sqlglot/archive/{sha}
 tarfile.open(fileobj=io.BytesIO(data)).extractall("/opt")
 os.rename(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 P
-COPY selector.py patchlib.py snapshot.py replay.py runner.py /app/
+COPY selector.py patchlib.py snapshot.py replay.py /app/
 COPY data/map.json.gz data/replay.json.gz data/vmap.json.gz /app/data/
 # the TPC tests are proven safe by replaying single queries: their CSV tables, parsed at build time like setUpClass
 RUN PYTHONHASHSEED=0 python /app/replay.py tables /app/data/replay_tables.pkl
