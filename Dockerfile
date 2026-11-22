@@ -9,7 +9,7 @@ tarfile.open(fileobj=io.BytesIO(data)).extractall("/opt")
 os.rename(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 P
 COPY selector.py patchlib.py snapshot.py replay.py /app/
-COPY data/map.json.gz data/replay.json.gz /app/data/
+COPY data/map.json.gz data/replay.json.gz data/vmap.json.gz /app/data/
 # the TPC tests are proven safe by replaying single queries: their CSV tables, parsed at build time like setUpClass
 RUN PYTHONHASHSEED=0 python /app/replay.py tables /app/data/replay_tables.pkl
 # The container's disk is read-only at run time: ship the byte-code so imports do not compile anything.

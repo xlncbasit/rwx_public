@@ -303,6 +303,7 @@ def impact_line(cx, f, tree, line, insert, out, st):
     # definition-time code at module/class level: defs/classes are judged by their own coverage; everything else
     # (constants, imports, bases, new members) by comparing what the old and the patched module actually define
     if own and isinstance(stmt, FUNCS):  # signature/decorator/default edit: whoever runs the body is affected
+        st["header"] = True
         kids = child_stmts(stmt)
         a = kids[0].lineno if kids else stmt.end_lineno
         out.update(cx.cov_range(f, a, stmt.end_lineno))
@@ -487,6 +488,90 @@ def executor_unaffected(cx, path, new_text):
     return out
 
 
+_OPS_RX = re.compile(r"<=|>=|<|>|\band\b|\bor\b")
+VMAP = Path(os.environ.get("VMAP_FILE", HERE / "data" / "vmap.json.gz"))
+_ORD = {ast.Lt: {"<"}, ast.LtE: {"<", "="}, ast.Gt: {">"}, ast.GtE: {">", "="}}  # relations under which the op is true
+
+
+def _one_op_change(old_t, new_t):
+    """(old op node, new op node, parent in the old tree) if the trees differ only in one comparison operator within
+    < <= > >= or one and/or; else None."""
+    def bfs(t):  # (node, parent) in breadth-first order; operator nodes are shared singletons, so keep the parent
+        out, q = [], [(t, None)]
+        while q:
+            n, par = q.pop(0)
+            out.append((n, par))
+            q.extend((c, n) for c in ast.iter_child_nodes(n))
+        return out
+
+    pa, pb = bfs(old_t), bfs(new_t)
+    if len(pa) != len(pb):
+        return None
+    diff = None
+    for (x, px), (y, _) in zip(pa, pb):
+        if type(x) is not type(y):
+            if diff is not None:
+                return None
+            diff = (x, y, px)
+            continue
+        for (k, v), (k2, w) in zip(ast.iter_fields(x), ast.iter_fields(y)):
+            if isinstance(v, list):
+                if len(v) != len(w) or any(type(i) is not type(j) and not (isinstance(i, ast.AST) and isinstance(j, ast.AST)) for i, j in zip(v, w)):
+                    return None
+                if any(not isinstance(i, ast.AST) and i != j for i, j in zip(v, w)):
+                    return None
+            elif not isinstance(v, ast.AST) and v != w:
+                return None
+    if diff is None:
+        return None
+    x, y, n = diff
+    if not ({type(x), type(y)} <= set(_ORD) or {type(x), type(y)} == {ast.And, ast.Or}):
+        return None
+    if isinstance(n, ast.Compare) and len(n.ops) == 1 or isinstance(n, ast.BoolOp):
+        return x, y, n
+    return None
+
+
+def value_unaffected(cx, f, old_t, new_t, line, chosen):
+    """Tests of `chosen` that provably see no difference from a single operator swap on `line`: on every evaluation of
+    the node in the test's own (instrumented, isolated) run, the new operator gave the same result as the old one."""
+    ch = _one_op_change(old_t, new_t)
+    if ch is None:
+        return set()
+    x, y, node = ch
+    if node.lineno != line or node.end_lineno != line:
+        return set()
+    if not hasattr(cx, "vmap"):
+        cx.vmap = None
+        if VMAP.exists():
+            with gzip.open(VMAP, "rt") as fh:
+                cx.vmap = json.load(fh)
+            cx.vbad = set(cx.vmap["bad"])
+    if cx.vmap is None:
+        return set()
+    nid = f"{f}:{node.lineno}:{node.col_offset}"
+    safe = set()
+    if isinstance(node, ast.Compare):
+        for codes, ts in cx.vmap["cmp"].get(nid, {}).items():
+            if "?" not in codes and all((c in _ORD[type(x)]) == (c in _ORD[type(y)]) for c in codes):
+                safe.update(ts)
+    else:
+        safe.update(cx.vmap["bool"].get(nid, {}).get("T" if isinstance(x, ast.And) else "F", ()))
+    out = set()
+    for n in chosen & safe:
+        path = cx.T[n]["file"]
+        if n in cx.vbad:  # its instrumented run did not pass (pool workers and subprocesses are not instrumented)
+            continue
+        if path not in _pooled:
+            p = SRC / path
+            _pooled[path] = not p.exists() or bool(_POOL.search(p.read_text()))
+        if _pooled[path]:  # work in other processes was not recorded
+            continue
+        out.add(n)
+    dbg("value map", nid, type(x).__name__, "->", type(y).__name__, "drop", len(out), "of", len(chosen))
+    return out
+
+
 def impact_file(cx, fp, info=None):
     """Set of tests, or None meaning 'run everything'. `info` gets the patched source and, when every change is
     plain runtime code inside function bodies, the changed line ranges ("ranges")."""
@@ -529,6 +614,7 @@ def impact_file(cx, fp, info=None):
     except SyntaxError:  # the module no longer imports
         return set(cx.mods.get(M, ())) or set(cx.all)
     if ast.dump(_SameIdentityEq().visit(strip_types(ast.parse(old_text)))) == ast.dump(_SameIdentityEq().visit(strip_types(new_t))):
+        info["ranges"] = []  # comments, docstrings, annotations: nothing runs differently
         return set()
     out, sem, st = set(), False, {"mods": set(), "ranges": []}
     for removed, added, pos in groups(fp):
@@ -539,6 +625,15 @@ def impact_file(cx, fp, info=None):
             return None
         sem = sem or SEM in rs
     info["ranges"] = st["ranges"]
+    if st.get("header"):
+        info["header"] = True
+    if not sem and not st.get("header") and out:
+        g = groups(fp)
+        if len(g) == 1 and len(g[0][0]) == 1 and g[0][1] == 1:
+            l = g[0][0][0]
+            a_, b_ = old_text.split("\n")[l - 1], new_text.split("\n")[l - 1]
+            if _OPS_RX.sub("@", a_) == _OPS_RX.sub("@", b_):  # cheap pre-check: only an operator differs
+                out -= value_unaffected(cx, f, old_t, ast.parse(new_text), l, out)
     if sem:
         rep = {}
         r = sem_tests(cx, f, new_text, st["mods"], rep)
@@ -634,7 +729,7 @@ def replay_drop(cx, cand, ranges, pairs, patched, soft=(), fixtures=None):
         dbg("batch budget", round(est, 1))
         return drop
     cx.replay_left -= est
-    spec = {"patched": patched, "fixtures": fixtures or {}, "tests": [{k: v for k, v in j.items() if k != "n"} for j in jobs], "cap": est * 1.25 + 0.3}
+    spec = {"patched": patched, "fixtures": fixtures or {}, "tests": [{k: v for k, v in j.items() if k != "n"} for j in jobs], "cap": est * 2 + 0.5}
     try:
         p = subprocess.run([sys.executable, str(HERE / "replay.py"), "verify"], input=json.dumps(spec), capture_output=True,
                            text=True, timeout=REPLAY_BUDGET * 4 + 10,
@@ -648,6 +743,10 @@ def replay_drop(cx, cand, ranges, pairs, patched, soft=(), fixtures=None):
         if ok.get(j["test"]) is True:
             drop.add(j["n"])
     return drop
+
+_POOL = re.compile(r"ProcessPool|multiprocessing|get_context\(")
+_pooled = {}
+
 
 def split(cx, chosen):
     if not chosen:
@@ -672,7 +771,8 @@ def main():
         cx = Ctx(tests, json.load(fh))
     cx.replayable = {t["number"] for t in tests if t["id"] in REPLAYABLE}
     commits = sorted((DATA / "commits").glob("*.patch"))
-    cx.replay_left = REPLAY_SHARE * len(commits)  # keep the whole batch well inside the time limit
+    cx.replay_left = REPLAY_SHARE * len(commits)
+    cx.T = {t["number"]: t for t in tests}  # keep the whole batch well inside the time limit
     for p in commits:
         run_commit(cx, p)
 
