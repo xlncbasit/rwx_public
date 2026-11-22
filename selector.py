@@ -13,10 +13,13 @@ HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 SRC = Path(os.environ.get("SQLGLOT_DIR", "/opt/sqlglot"))
 MAP = Path(os.environ.get("MAP_FILE", HERE / "data" / "map.json.gz"))
-TPCDS_MAP = Path(os.environ.get("TPCDS_MAP", HERE / "data" / "tpcds.json.gz"))
-TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-TPCDS_BUDGET = float(os.environ.get("TPCDS_BUDGET", "5"))  # local CPU s of replay worth spending to drop a 21.5 s test (graders run ~2.6x slower)
-TPCDS_SHARE = float(os.environ.get("TPCDS_SHARE", "0.6"))  # replay CPU s allowed per commit of the batch
+REPLAY_MAP = Path(os.environ.get("REPLAY_MAP", HERE / "data" / "replay.json.gz"))
+_P = "tests/test_executor.py::TestExecutor::"
+REPLAYABLE = {_P + "test_execute_tpcds": ("ds", "exec", "tpcds"), _P + "test_execute_tpch": ("h", "exec", "tpch"),
+              _P + "test_optimized_tpch": ("oh", "opt", "tpch")}  # same table as replay.TESTS
+REPLAY_BUDGET = float(os.environ.get("REPLAY_BUDGET", "5"))  # most local CPU s of replay spent on one test
+REPLAY_SHARE_OF_TEST = float(os.environ.get("REPLAY_SHARE_OF_TEST", "0.25"))  # ... and at most this share of its recorded seconds
+REPLAY_SHARE = float(os.environ.get("REPLAY_SHARE", "0.6"))  # replay CPU s allowed per commit of the batch
 WORKER_MS, MAXW = 2000, 8
 
 
@@ -496,7 +499,10 @@ def impact_file(cx, fp, info=None):
             return set()
         if fp.new is None or fp.old != fp.new or path not in cx.fix:
             return set(cx.fix.get(path, cx.fixfallback))
-        return set(cx.fix[path]) - executor_unaffected(cx, path, patchlib.apply((SRC / path).read_text(), fp))
+        new_text = patchlib.apply((SRC / path).read_text(), fp)
+        if path in EXEC_FIXTURES:
+            info["fixture"] = (EXEC_FIXTURES[path], new_text)
+        return set(cx.fix[path]) - executor_unaffected(cx, path, new_text)
     if path.endswith(RUNNER_FILES) or path.startswith(RUNNER_FILES):
         return None
     if path.startswith("tests/"):
@@ -542,6 +548,7 @@ def impact_file(cx, fp, info=None):
         if rep.get("opaque"):
             dbg("opaque-why", f, rep["opaque"])
             del info["ranges"]
+            info["sem_opaque"] = True
         else:
             info["sem"] = rep
     return out
@@ -552,77 +559,95 @@ def dbg(*a):
         print("tpcds:", *a, file=sys.stderr)
 
 
-def tpcds_drop(cx, ranges, pairs, patched):
-    """True if test_execute_tpcds provably still passes: every query whose run reaches a changed line or reads a changed
-    class constant gives the same duckdb SQL and executor result as on the pinned commit, replayed with the patched
-    sources up to the first checkpoint (parsed tree, optimized tree) after which nothing changed is reached."""
-    if not hasattr(cx, "tq"):
-        load_tq(cx)
-    tq = cx.tq
-    if tq is None:
-        return False
-    T = cx.tpcds
-    hit = set()  # contexts ("setup", "q12", "o12", "e12") that observe the change
-    pid = {n: j for j, n in enumerate(tq["acc_names"])}
+def replay_drop(cx, cand, ranges, pairs, patched, soft=(), fixtures=None):
+    """The tests of `cand` (replayable TPC tests) that provably still pass: every query whose run reaches a changed
+    line or reads a changed class constant gives the same SQL for duckdb and the same executor result as on the
+    pinned commit, replayed with the patched sources up to the first checkpoint (parsed tree, optimized tree)
+    after which nothing changed is reached."""
+    if not hasattr(cx, "rq"):
+        load_rq(cx)
+    rq = cx.rq
+    if rq is None:
+        return set()
+    hit = set()  # contexts ("ds:q12", "h:e3", "setup:tpch", ...) that observe the change
+    pid = {n: j for j, n in enumerate(rq["acc_names"])}
     want_ids = {pid[p] for p in pairs.get("pairs", ()) if p in pid}
-    for c, ids in tq["acc"].items():
+    for c, ids in rq["acc"].items():
         if want_ids & ids:
             hit.add(c)
     names = pairs.get("names", set())
     files = {class_file(T) for T in pairs.get("private", ())}
     if None in files:
-        return False
+        return set()
     if names or files:  # a changed module global is read by lines that name it; a class's private derived state by its own code
         rx = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b") if names else None
-        for f, d in tq["by_line"].items():
+        for f, d in rq["by_line"].items():
             src = cx.source(f) if rx else None
             for l, cs in d.items():
                 if f in files or rx and l <= len(src) and rx.search(src[l - 1]):
                     hit |= cs
+    unmapped = set()  # changed lines some candidate reaches outside the replayed queries (pool, class setup, ...)
     for f, a, b in ranges:
-        by = tq["by_line"].get(f, {})
+        by = rq["by_line"].get(f, {})
         cv = cx.cov.get(f, {})
         for l in range(a, b + 1):
             cs = by.get(l)
             if cs:
                 hit |= cs
-            elif T in cv.get(l, ()):  # the test reaches this line outside the replayed queries (pool, setup class, ...)
-                dbg("guard", f, l)
-                return False
-    n = len(tq["secs"])
-    if "setup" in hit:  # the tables themselves are built by changed code
-        hit |= {f"e{i}" for i in range(n)}
-    mode, est = {}, 0.9
-    for i in range(n):
-        if f"e{i}" in hit:
-            mode[i], k = None, 0
-        elif f"o{i}" in hit:
-            mode[i], k = "o", 1
-        elif f"q{i}" in hit:
-            mode[i], k = "p", 2
-        else:
+            for t in cand:
+                if t in cv.get(l, ()) and not any(c.startswith(rq["key"][t] + ":") for c in cs or ()):
+                    unmapped.add(t)
+    jobs, est, drop = [], 0.6, set()
+    for t in sorted(cand - unmapped):
+        key, bench = rq["key"][t], rq["bench"][t]
+        if f"setup:{bench}" in hit:  # tables built by changed code are also pickled to the pool: not replayed
             continue
-        est += tq["secs"][i][k]
-    if not mode:
-        return True
-    if est > TPCDS_BUDGET or cx.replay_left < est:
-        dbg("budget", len(mode), round(est, 1))
-        return False
+        fixtures = fixtures or {}
+        mode, cost = {}, 0.0
+        for i, row in rq["secs"][t].items():
+            if t in soft:  # cannot tell which queries see the change: replay them all to the end
+                mode[i], k = None, 0
+            elif f"{key}:e{i}" in hit:
+                mode[i], k = None, 0
+            elif f"{key}:o{i}" in hit:
+                mode[i], k = "o", 1
+            elif f"{key}:q{i}" in hit:
+                mode[i], k = "p", 2
+            else:
+                continue
+            cost += row[k]
+        if bench in fixtures:  # the replay also checks every fixture entry that changed (parsed-tree checkpoint)
+            cost += sum(row[2] for row in rq["secs"][t].values())
+        elif not mode:
+            drop.add(t)
+            continue
+        if cost + 0.3 > REPLAY_SHARE_OF_TEST * cx.ms[t] / 1000 or cost > REPLAY_BUDGET:
+            dbg("budget", t, len(mode), round(cost, 1))
+            continue
+        order = sorted(mode, key=lambda i: ({"p": 0, "o": 1, None: 2}[mode[i]], i))  # cheap checks first: a failure stops early
+        jobs.append({"test": rq["id"][t], "n": t, "queries": order, "mode": {str(i): mode[i] for i in mode},
+                     "want": {str(i): rq["want"][t][i] for i in (rq["want"][t] if bench in fixtures else mode)}})
+        est += cost
+    if not jobs:
+        return drop
+    if cx.replay_left < est:
+        dbg("batch budget", round(est, 1))
+        return drop
     cx.replay_left -= est
-    order = sorted(mode, key=lambda i: ({"p": 0, "o": 1, None: 2}[mode[i]], i))  # cheap checks first: a failure stops early
-    spec = {"patched": patched, "queries": order, "mode": {str(i): mode[i] for i in mode}, "cap": est * 1.25 + 0.3,
-            "want": {str(i): tq["want"][str(i)] for i in mode}}
+    spec = {"patched": patched, "fixtures": fixtures or {}, "tests": [{k: v for k, v in j.items() if k != "n"} for j in jobs], "cap": est * 1.25 + 0.3}
     try:
-        p = subprocess.run([sys.executable, str(HERE / "tpcds.py"), "verify"], input=json.dumps(spec), capture_output=True,
-                           text=True, timeout=TPCDS_BUDGET * 4 + 10,
+        p = subprocess.run([sys.executable, str(HERE / "replay.py"), "verify"], input=json.dumps(spec), capture_output=True,
+                           text=True, timeout=REPLAY_BUDGET * 4 + 10,
                            env={**os.environ, "SQLGLOT_DIR": str(SRC), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0",
-                                "TPCDS_ALARM": str(int(TPCDS_BUDGET * 4 + 5))})
-        ok = json.loads(p.stdout.strip().splitlines()[-1]).get("ok") is True
-        dbg("verify", len(mode), round(est, 1), ok)
-        return ok
+                                "REPLAY_ALARM": str(int(REPLAY_BUDGET * 4 + 5))})
+        ok = json.loads(p.stdout.strip().splitlines()[-1]).get("ok", {})
     except Exception:
-        return False
-
+        ok = {}
+    for j in jobs:
+        dbg("verify", j["test"].rsplit("::", 1)[1], len(j["queries"]), ok.get(j["test"]))
+        if ok.get(j["test"]) is True:
+            drop.add(j["n"])
+    return drop
 
 def split(cx, chosen):
     if not chosen:
@@ -645,9 +670,9 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     with gzip.open(MAP, "rt") as fh:
         cx = Ctx(tests, json.load(fh))
-    cx.tpcds = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
+    cx.replayable = {t["number"] for t in tests if t["id"] in REPLAYABLE}
     commits = sorted((DATA / "commits").glob("*.patch"))
-    cx.replay_left = TPCDS_SHARE * len(commits)  # keep the whole batch well inside the time limit
+    cx.replay_left = REPLAY_SHARE * len(commits)  # keep the whole batch well inside the time limit
     for p in commits:
         run_commit(cx, p)
 
@@ -663,24 +688,35 @@ def class_file(q):
     return None
 
 
-def load_tq(cx):
-    cx.tq = None
-    if cx.tpcds is not None and TPCDS_MAP.exists():
-        with gzip.open(TPCDS_MAP, "rt") as fh:
-            tq = json.load(fh)
-        by = {}
-        for c, d in tq["lines"].items():
-            for f, ls in d.items():
-                bl = by.setdefault(f, {})
-                for l in ls:
-                    bl.setdefault(l, set()).add(c)
-        cx.tq = {"by_line": by, "acc": {c: set(v) for c, v in tq["acc"].items()}, "acc_names": tq["acc_names"],
-                 "secs": {int(i): v for i, v in tq["secs"].items()}, "want": tq["want"]}
+def load_rq(cx):
+    """The replay map, keyed by test number."""
+    cx.rq = None
+    if not REPLAY_MAP.exists():
+        return
+    with gzip.open(REPLAY_MAP, "rt") as fh:
+        m = json.load(fh)
+    num = {t["id"]: t["number"] for t in cx.tests}
+    by = {}
+    for c, d in m["lines"].items():
+        for f, ls in d.items():
+            bl = by.setdefault(f, {})
+            for l in ls:
+                bl.setdefault(l, set()).add(c)
+    rq = {"by_line": by, "acc": {c: set(v) for c, v in m["acc"].items()}, "acc_names": m["acc_names"],
+          "key": {}, "bench": {}, "id": {}, "secs": {}, "want": {}}
+    for tid, (key, kind, bench) in REPLAYABLE.items():
+        if tid in num and tid in m["want"]:
+            n = num[tid]
+            rq["key"][n], rq["bench"][n], rq["id"][n] = key, bench, tid
+            rq["secs"][n] = {int(i): v for i, v in m["secs"][tid].items()}
+            rq["want"][n] = {int(i): v for i, v in m["want"][tid].items()}
+    cx.rq = rq
 
 def run_commit(cx, p):
     chosen = set()
     try:
         opaque, ranges, pairs, patched = set(), [], {}, {}
+        soft, fixtures = set(), {}  # tests a change reaches in ways only a replay of every query can judge; edited TPC fixtures
         for fp in patchlib.parse(p.read_text()):
             info = {}
             r = impact_file(cx, fp, info)
@@ -696,12 +732,17 @@ def run_commit(cx, p):
                 for k, v in info.get("sem", {}).items():
                     if k in ("pairs", "names", "private"):
                         pairs.setdefault(k, set()).update(v)
+            elif "fixture" in info:
+                fixtures[info["fixture"][0]] = info["fixture"][1]
+                opaque |= r - cx.replayable
+            elif info.get("sem_opaque") and not fp.path.startswith("sqlglot/executor/"):
+                soft |= r
             else:
                 opaque |= r
-        if cx.tpcds in chosen and cx.tpcds in opaque:
-            dbg("opaque", p.stem)
-        if cx.tpcds in chosen and cx.tpcds not in opaque and (dbg("commit", p.stem) or tpcds_drop(cx, ranges, pairs, patched)):
-            chosen.discard(cx.tpcds)
+        cand = (cx.replayable & chosen) - opaque
+        if cand:
+            dbg("commit", p.stem)
+            chosen -= replay_drop(cx, cand, ranges, pairs, patched, soft, fixtures)
     except Exception as e:  # never miss because of a bug: run everything
         print(f"{p.stem}: {e!r}", file=sys.stderr)
         chosen = set(cx.all)
