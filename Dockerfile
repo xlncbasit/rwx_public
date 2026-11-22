@@ -16,6 +16,4 @@ RUN PYTHONHASHSEED=0 python /app/replay.py tables /app/data/replay_tables.pkl
 RUN python -m compileall -q /opt/sqlglot/sqlglot /app && chmod -R a+rX /app /opt/sqlglot
 
 ENV SQLGLOT_DIR=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
-# PROBE (not for the final): select nothing where more than 200 tests would be chosen
-ENV PROBE_BIG=200
 CMD ["python", "/app/selector.py"]
