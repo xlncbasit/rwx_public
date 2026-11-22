@@ -643,6 +643,33 @@ def value_unaffected(cx, f, old_t, new_t, line, chosen):
     return out
 
 
+def config_unchanged(fp):
+    """A test-runner config file whose parsed content is identical (comments, whitespace, ordering of nothing that
+    matters): pytest and setuptools read the same settings, so no test can change. Anything else: not proven."""
+    if fp.binary or fp.old is None or fp.new is None or fp.old != fp.new:
+        return False
+    try:
+        old_text = (SRC / fp.path).read_text()
+        new_text = patchlib.apply(old_text, fp)
+        if fp.path.endswith(".toml"):
+            import tomllib
+            return tomllib.loads(old_text) == tomllib.loads(new_text)
+        if fp.path.endswith((".cfg", ".ini")):
+            import configparser
+
+            def parse(t):
+                c = configparser.RawConfigParser(strict=True, interpolation=None)
+                c.optionxform = str
+                c.read_string(t)
+                return {s_: dict(c.items(s_)) for s_ in c.sections()}, dict(c.defaults())
+            return parse(old_text) == parse(new_text)
+        if fp.path.endswith(".py"):
+            return ast.dump(ast.parse(old_text)) == ast.dump(ast.parse(new_text))
+    except Exception:
+        return False
+    return False
+
+
 def impact_file(cx, fp, info=None):
     """Set of tests, or None meaning 'run everything'. `info` gets the patched source and, when every change is
     plain runtime code inside function bodies, the changed line ranges ("ranges")."""
@@ -660,7 +687,7 @@ def impact_file(cx, fp, info=None):
             info["fixture"] = (EXEC_FIXTURES[path], new_text)
         return set(cx.fix[path]) - executor_unaffected(cx, path, new_text)
     if path.endswith(RUNNER_FILES) or path.startswith(RUNNER_FILES):
-        return None
+        return set() if config_unchanged(fp) else None
     if path.startswith("tests/"):
         return impact_test_file(cx, fp) if path.endswith(".py") else (set() if path.endswith(INERT_SUFFIX) else None)
     if not path.startswith("sqlglot/"):
