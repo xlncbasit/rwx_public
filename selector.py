@@ -3,7 +3,7 @@
 Uses only maps built from the pinned sqlglot commit (per-test line coverage, fixture files opened, classes
 instantiated, modules loaded); never a table from patches to tests.
 """
-import ast, bisect, gzip, json, os, re, subprocess, sys
+import ast, bisect, copy, gzip, json, os, pickle, re, subprocess, sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +32,7 @@ class Ctx:
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         sets = m["sets"]
-        self.cov = {f: {int(l): sets[i] for l, i in d.items()} for f, d in m["cov"].items()}
+        self.cov = m["_cov"] if "_cov" in m else {f: {int(l): sets[i] for l, i in d.items()} for f, d in m["cov"].items()}
         self.fix = {f: set(v) for f, v in m["fix"].items()}
         self.fixfallback = set(m["fixfallback"])
         self.used = {}  # class qualname -> tests that instantiate it (or a subclass)
@@ -206,6 +206,73 @@ class _SameIdentityEq(ast.NodeTransformer):
 
 
 FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_BODIED = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+_norm_old = {}
+
+
+def _norm(n, eq):
+    n = strip_types(n)
+    return _SameIdentityEq().visit(n) if eq else n
+
+
+def _changed_lines(fp):
+    """(old line numbers removed, new line numbers added)."""
+    rem, add = set(), set()
+    for os_, ol, ns, nl, lines in fp.hunks:
+        o, nn = os_, ns
+        for tag, _ in lines:
+            if tag == "-":
+                rem.add(o)
+                o += 1
+            elif tag == "+":
+                add.add(nn)
+                nn += 1
+            else:
+                o += 1
+                nn += 1
+    return rem, add
+
+
+def same_tree(path, old_text, new_t, fp, eq):
+    """Whether old and patched module are the same after normalisation (annotations and docstrings dropped, and
+    `is None` written as `== None` if eq). Only statements whose text the patch touches are compared; untouched
+    statements are identical text, hence identical trees. new_t is normalised in place where compared."""
+    key = (path, eq)
+    if key not in _norm_old:
+        _norm_old[key] = ast.parse(old_text)  # the pinned file never changes: parse once, normalise nodes when compared
+    rem, add = _changed_lines(fp)
+
+    def span(n):
+        first = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", ())])
+        return first, n.end_lineno
+
+    def touched(n, lines):
+        a, b = span(n)
+        return any(a <= l <= b for l in lines)
+
+    def body(n):
+        b = n.body
+        if b and len(b) > 1 and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+            b = b[1:]
+        return b
+
+    def same(o, n):
+        if type(o) is not type(n):
+            return False
+        if not isinstance(n, ast.Module) and not touched(o, rem) and not touched(n, add):
+            return True
+        if isinstance(n, _BODIED):
+            nb, ob = body(n), body(o)
+            if len(ob) != len(nb):
+                return False
+            ho, hn = copy.copy(o), copy.copy(n)
+            ho.body, hn.body = [], []
+            if ast.dump(_norm(ho, eq)) != ast.dump(_norm(hn, eq)):
+                return False
+            return all(same(x, y) for x, y in zip(ob, nb))
+        return ast.dump(_norm(o, eq)) == ast.dump(_norm(n, eq))
+
+    return same(_norm_old[key], new_t)
 SEM = "sem"  # change at definition time: decide by diffing the module state
 
 
@@ -436,7 +503,7 @@ def impact_test_file(cx, fp):
         new_t = ast.parse(new_text)
     except SyntaxError:
         return whole
-    if ast.dump(strip_types(ast.parse(old_text))) == ast.dump(strip_types(new_t)):
+    if same_tree(path, old_text, new_t, fp, False):
         return set()
     out = set()
     pending = [(l, False) for removed, added, pos in groups(fp) for l in removed]
@@ -535,7 +602,11 @@ def _one_op_change(old_t, new_t):
 def value_unaffected(cx, f, old_t, new_t, line, chosen):
     """Tests of `chosen` that provably see no difference from a single operator swap on `line`: on every evaluation of
     the node in the test's own (instrumented, isolated) run, the new operator gave the same result as the old one."""
-    ch = _one_op_change(old_t, new_t)
+    fo = next((n for n in reversed(locate(old_t, line)) if isinstance(n, FUNCS)), None)
+    fn = next((n for n in reversed(locate(new_t, line)) if isinstance(n, FUNCS)), None)
+    if fo is None or fn is None:
+        return set()
+    ch = _one_op_change(fo, fn)  # the rest of the file is untouched text
     if ch is None:
         return set()
     x, y, node = ch
@@ -613,7 +684,7 @@ def impact_file(cx, fp, info=None):
         new_t = ast.parse(new_text)
     except SyntaxError:  # the module no longer imports
         return set(cx.mods.get(M, ())) or set(cx.all)
-    if ast.dump(_SameIdentityEq().visit(strip_types(ast.parse(old_text)))) == ast.dump(_SameIdentityEq().visit(strip_types(new_t))):
+    if same_tree(f, old_text, new_t, fp, True):
         info["ranges"] = []  # comments, docstrings, annotations: nothing runs differently
         return set()
     out, sem, st = set(), False, {"mods": set(), "ranges": []}
@@ -767,8 +838,13 @@ def split(cx, chosen):
 
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
-    with gzip.open(MAP, "rt") as fh:
-        cx = Ctx(tests, json.load(fh))
+    pk = MAP.with_suffix("").with_suffix(".pkl")  # written at image build time: loads faster than the JSON
+    if pk.exists():
+        with open(pk, "rb") as fh:
+            cx = Ctx(tests, pickle.load(fh))
+    else:
+        with gzip.open(MAP, "rt") as fh:
+            cx = Ctx(tests, json.load(fh))
     cx.replayable = {t["number"] for t in tests if t["id"] in REPLAYABLE}
     commits = sorted((DATA / "commits").glob("*.patch"))
     cx.replay_left = REPLAY_SHARE * len(commits)
@@ -788,6 +864,27 @@ def class_file(q):
     return None
 
 
+class _LineIndex(dict):
+    """file -> line -> contexts reaching it, built per file on first use."""
+
+    def __init__(self, lines):
+        super().__init__()
+        self.lines = lines
+
+    def get(self, f, default=None):
+        if f not in self:
+            by = {}
+            for c, d in self.lines.items():
+                for l in d.get(f, ()):
+                    by.setdefault(l, set()).add(c)
+            self[f] = by
+        return dict.get(self, f, default)
+
+    def items(self):
+        for f in {f for d in self.lines.values() for f in d}:
+            yield f, self.get(f)
+
+
 def load_rq(cx):
     """The replay map, keyed by test number."""
     cx.rq = None
@@ -796,13 +893,7 @@ def load_rq(cx):
     with gzip.open(REPLAY_MAP, "rt") as fh:
         m = json.load(fh)
     num = {t["id"]: t["number"] for t in cx.tests}
-    by = {}
-    for c, d in m["lines"].items():
-        for f, ls in d.items():
-            bl = by.setdefault(f, {})
-            for l in ls:
-                bl.setdefault(l, set()).add(c)
-    rq = {"by_line": by, "acc": {c: set(v) for c, v in m["acc"].items()}, "acc_names": m["acc_names"],
+    rq = {"by_line": _LineIndex(m["lines"]), "acc": {c: set(v) for c, v in m["acc"].items()}, "acc_names": m["acc_names"],
           "key": {}, "bench": {}, "id": {}, "secs": {}, "want": {}}
     for tid, (key, kind, bench) in REPLAYABLE.items():
         if tid in num and tid in m["want"]:
