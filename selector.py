@@ -87,7 +87,7 @@ class Ctx:
         r = self._snap.get(key)
         if r is None:
             p = subprocess.run([sys.executable, str(HERE / "snapshot.py")], input=json.dumps({"mods": sorted(mods), "patched": patched}),
-                               capture_output=True, text=True, timeout=90, env={**os.environ, "SQLGLOT_DIR": str(SRC), "PYTHONDONTWRITEBYTECODE": "1"})
+                               capture_output=True, text=True, timeout=90, env={**os.environ, "SQLGLOT_DIR": str(SRC), "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0"})
             r = self._snap[key] = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {"ok": False}
         return r
 
@@ -291,8 +291,11 @@ def sem_tests(cx, f, new_text, extra=()):
                     changed.append((C, attr))
                     for T in (C, *cx.subs(C)):
                         out |= cx.acc.get(attr, {}).get(T, set())
-                    if attr not in cx.acc:
-                        out |= loaded
+                        if cx.acci.get(attr, {}).get(T) or attr.startswith("_"):
+                            # state derived at class creation, or read while a module was imported, may be cached in objects we cannot see
+                            out |= set(cx.used.get(T, ()))
+                    if attr not in cx.acc:  # read through something other than a recorded descriptor
+                        out |= set(cx.used.get(C, ())) or loaded
                 else:  # new constant: nobody could have read it through a recorded descriptor
                     out |= cx.taint(attr) & (set(cx.used.get(C, ())) or loaded)
         for mod in set(a["glob"]) | set(b["glob"]):
@@ -330,27 +333,88 @@ def groups(fp):
     return res
 
 
-NO_IMPACT = (".md", ".rst", ".txt", ".png", ".svg")
+INERT_SUFFIX = (".md", ".rst", ".txt", ".png", ".svg", ".jpg", ".gif", ".ico", ".lock", ".yml", ".yaml", ".cfg_", ".typed")
+INERT_TOP = ("docs/", "sqlglotrs/", ".github/", "posts/", "benchmarks/", "LICENSE", "CHANGELOG", "README", "Makefile", ".gitignore", ".pre-commit", "MANIFEST")
+RUNNER_FILES = ("pyproject.toml", "setup.py", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "tests/conftest.py", "requirements")
+
+
+def tests_in(cx, path):
+    return set(cx.by_file.get(path, ()))
+
+
+def importers(cx, path):
+    """Tests of the test files that import the test module `path` (e.g. the shared Validator helper)."""
+    mod = path[:-3].replace("/", ".")
+    pkg, _, leaf = mod.rpartition(".")
+    rx = re.compile(r"^\s*(?:from\s+%s\s+import\s+(?:.*\b%s\b)|from\s+%s\s+import|import\s+%s\b)" % (re.escape(pkg), re.escape(leaf), re.escape(mod), re.escape(mod)), re.M)
+    out = set()
+    for f in cx.by_file:
+        p = SRC / f
+        if f != path and p.exists() and rx.search(p.read_text()):
+            out |= tests_in(cx, f)
+    return out
+
+
+def impact_test_file(cx, fp):
+    """Edits to files under tests/: the changed test functions, or the whole file (and its importers) for anything else."""
+    path = fp.path
+    whole = tests_in(cx, path) | importers(cx, path)
+    if fp.old is None:  # a new file: no numbered test lives there and nothing imports it yet
+        return set()
+    if fp.new is None or fp.old != fp.new:
+        return whole
+    old_text = (SRC / path).read_text()
+    new_text = patchlib.apply(old_text, fp)
+    try:
+        old_t = ast.parse(old_text)
+        new_t = ast.parse(new_text)
+    except SyntaxError:
+        return whole
+    if ast.dump(strip_types(ast.parse(old_text))) == ast.dump(strip_types(new_t)):
+        return set()
+    out = set()
+    pending = [(l, False) for removed, added, pos in groups(fp) for l in removed]
+    pending += [(pos, True) for removed, added, pos in groups(fp) if added and (not removed or added > len(removed))]
+    for line, insert in pending:
+        chain = locate(old_t, line)
+        func = next((n for n in reversed(chain) if isinstance(n, FUNCS)), None)
+        klass = next((n for n in reversed(chain) if isinstance(n, ast.ClassDef)), None)
+        kids = child_stmts(func) if func is not None else []
+        if func is None or not func.name.startswith("test") or not kids or line < kids[0].lineno or (insert and line > func.end_lineno):
+            return whole
+        suffix = (f"::{klass.name}" if klass else "") + f"::{func.name}"
+        hit = {t["number"] for t in cx.tests if t["id"] == path + suffix}
+        if not hit:
+            return whole
+        out |= hit
+    return out
 
 
 def impact_file(cx, fp):
     """Set of tests, or None meaning 'run everything'."""
     path = fp.path
     if fp.binary:
-        return None
+        return set() if path.startswith(INERT_TOP) or path.endswith(INERT_SUFFIX) else None
     if path.startswith("tests/fixtures/"):
-        if fp.old is None or fp.new is None or path not in cx.fix:
-            return set(cx.fix.get(path, cx.fixfallback)) if fp.old and fp.new else None
+        if fp.old is None:
+            return set()
+        if fp.new is None or fp.old != fp.new or path not in cx.fix:
+            return set(cx.fix.get(path, cx.fixfallback))
         return set(cx.fix[path])
-    if path.endswith(NO_IMPACT) and not path.startswith(("sqlglot/", "tests/")):
-        return set()
-    if path.startswith("tests/") and path.endswith(".py"):
-        if fp.old and fp.new and path in cx.by_file and path.rsplit("/", 1)[-1].startswith("test_"):
-            return set(cx.by_file[path])
+    if path.endswith(RUNNER_FILES) or path.startswith(RUNNER_FILES):
         return None
-    if not (path.startswith("sqlglot/") and path.endswith(".py")) or fp.old is None or fp.new is None or fp.old != fp.new:
-        return None
+    if path.startswith("tests/"):
+        return impact_test_file(cx, fp) if path.endswith(".py") else (set() if path.endswith(INERT_SUFFIX) else None)
+    if not path.startswith("sqlglot/"):
+        return set() if path.startswith(INERT_TOP) or path.endswith(INERT_SUFFIX) else None
+    if not path.endswith(".py"):
+        return set() if path.endswith(INERT_SUFFIX) else None
     f = path
+    M = module_of(f)
+    if fp.old is None:  # a new module that nothing imports yet (an edit that imports it is analysed on its own)
+        return set()
+    if fp.new is None or fp.old != fp.new:  # deleted or moved: whoever loaded it breaks
+        return set(cx.mods.get(module_of(fp.old), ())) or set(cx.all)
     old_text = (SRC / f).read_text()
     new_text = patchlib.apply(old_text, fp)
     try:
@@ -359,8 +423,8 @@ def impact_file(cx, fp):
         return None
     try:
         new_t = ast.parse(new_text)
-    except SyntaxError:
-        return None  # the module no longer imports
+    except SyntaxError:  # the module no longer imports
+        return set(cx.mods.get(M, ())) or set(cx.all)
     if ast.dump(_SameIdentityEq().visit(strip_types(ast.parse(old_text)))) == ast.dump(_SameIdentityEq().visit(strip_types(new_t))):
         return set()
     out, sem, st = set(), False, {"mods": set()}
